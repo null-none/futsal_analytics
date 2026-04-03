@@ -3,13 +3,14 @@
 
 import time
 import csv
+import json
 import cv2
 import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 
 RADAR_W, RADAR_H = 240, 130
-HEAT_W, HEAT_H = 220, 140
+HEAT_W,  HEAT_H  = 220, 140
 PAD = 10
 _RADAR_TITLE_H = 18
 
@@ -36,7 +37,12 @@ class PlayerDetector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def select_court_corners(first_frame, timeout_sec=12):
+    def select_court_corners(first_frame, timeout_sec=12, save_path=None):
+        """
+        Click order: top-left → bottom-left → bottom-right → top-right
+        Keys: Esc/Space/Enter — skip | R — reset
+        Saves to JSON if save_path given. Returns np.float32 (4,2) or None.
+        """
         LABELS = ["1: top-left", "2: bottom-left", "3: bottom-right", "4: top-right"]
         COLORS = [(0, 255, 255), (0, 200, 255), (0, 140, 255), (0, 80, 255)]
 
@@ -48,6 +54,9 @@ class PlayerDetector:
         def on_mouse(event, x, y, *_):
             if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
                 pts.append((x, y))
+                if len(pts) == 4 and save_path is not None:
+                    Path(save_path).write_text(json.dumps(pts))
+                    print(f"[OK] Saved court corners to {save_path}")
 
         cv2.setMouseCallback(win, on_mouse)
         deadline = time.time() + timeout_sec
@@ -121,12 +130,12 @@ class PlayerDetector:
 
     @staticmethod
     def _draw_radar(frame, centers, frame_w, frame_h, homography):
-        x0 = frame_w - RADAR_W - PAD
-        y0 = PAD
+        x0  = frame_w - RADAR_W - PAD
+        y0  = PAD
         rx0 = x0 + 2
         ry0 = y0 + _RADAR_TITLE_H
-        rw = RADAR_W - 4
-        rh = RADAR_H - _RADAR_TITLE_H - 2
+        rw  = RADAR_W - 4
+        rh  = RADAR_H - _RADAR_TITLE_H - 2
         cx_mid = rx0 + rw // 2
         cy_mid = ry0 + rh // 2
 
@@ -141,8 +150,8 @@ class PlayerDetector:
         cv2.circle(frame, (cx_mid, cy_mid), r_circle, lc, 1, cv2.LINE_AA)
         cv2.circle(frame, (cx_mid, cy_mid), 2, lc, -1)
         r_goal = max(8, int(rw * 0.14))
-        cv2.ellipse(frame, (rx0, cy_mid), (r_goal, r_goal), 0, -90, 90, lc, 1, cv2.LINE_AA)
-        cv2.ellipse(frame, (rx0 + rw, cy_mid), (r_goal, r_goal), 0, 90, 270, lc, 1, cv2.LINE_AA)
+        cv2.ellipse(frame, (rx0,      cy_mid), (r_goal, r_goal), 0, -90,  90, lc, 1, cv2.LINE_AA)
+        cv2.ellipse(frame, (rx0 + rw, cy_mid), (r_goal, r_goal), 0,  90, 270, lc, 1, cv2.LINE_AA)
 
         cv2.rectangle(frame, (x0, y0), (x0 + RADAR_W, y0 + RADAR_H), (180, 180, 180), 1)
         cv2.putText(frame, "RADAR", (x0 + 6, y0 + _RADAR_TITLE_H - 4),
@@ -154,6 +163,7 @@ class PlayerDetector:
             return
 
         src_pts = np.array(centers, dtype=np.float32).reshape(-1, 1, 2)
+
         if homography is not None:
             dst = cv2.perspectiveTransform(src_pts, homography)
             radar_pts = []
@@ -212,14 +222,21 @@ class PlayerDetector:
             raise RuntimeError(f"Cannot open source: {src}")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         ok, first_frame = cap.read()
         if not ok:
             raise RuntimeError("Cannot read first frame")
 
-        court_corners = self.select_court_corners(first_frame)
+        # Load saved corners or select interactively
+        corners_file = self.out_dir / "court_corners.json"
+        if corners_file.exists():
+            court_corners = np.array(json.loads(corners_file.read_text()), dtype=np.float32)
+            print(f"[OK] Loaded court corners from {corners_file}")
+        else:
+            court_corners = self.select_court_corners(first_frame, save_path=corners_file)
+
         homography = None
         if court_corners is not None:
             dst_norm = np.array([[0, 0], [0, 1], [1, 1], [1, 0]], dtype=np.float32)
@@ -237,7 +254,7 @@ class PlayerDetector:
                 ["frame", "x1", "y1", "x2", "y2", "cx", "cy", "conf", "cls", "label"])
 
         heat_acc = np.zeros((h, w), dtype=np.float32)
-        blob_r = max(w, h) // 12
+        blob_r   = max(w, h) // 12
         frames_to_process = [first_frame]
 
         frame_id = 0
@@ -251,16 +268,16 @@ class PlayerDetector:
 
             results = model.predict(frame, imgsz=self.imgsz, conf=self.conf,
                                     verbose=False, classes=[0])
-            rows = []
+            rows    = []
             centers = []
 
             for r in results:
                 for b in r.boxes:
                     x1, y1, x2, y2 = b.xyxy[0].tolist()
                     conf_val = float(b.conf[0])
-                    cls_id = int(b.cls[0])
-                    label = r.names.get(cls_id, str(cls_id))
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    cls_id   = int(b.cls[0])
+                    label    = r.names.get(cls_id, str(cls_id))
+                    cx, cy   = (x1 + x2) / 2, (y1 + y2) / 2
 
                     self._draw_center_dot(frame, cx, cy, r=self.dot_radius)
                     centers.append((cx, cy))
